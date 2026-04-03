@@ -1,0 +1,21 @@
+# Crypto Sentiment Trading Bot
+# =============================
+
+# Core
+requests>=2.31.0
+numpy>=1.24.0
+pandas>=2.0.0
+schedule>=1.2.0
+
+# NLP / Sentiment
+transformers>=4.35.0
+torch>=2.1.0
+
+# Exchange connectivity
+ccxt>=4.0.0
+
+# Reddit API (optional, for authenticated access)
+# praw>=7.7.0
+
+# Optional: backtesting
+# vectorbt>=0.26.0
