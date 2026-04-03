@@ -22,6 +22,25 @@ logger = logging.getLogger("ingestion")
 class CryptoDataPipeline:
     def __init__(self, config: Config):
         self.config = config
+        self._reddit_token: str = ""
+        self._reddit_token_expiry: float = 0.0
+
+    def _get_reddit_token(self) -> str:
+        """Fetch OAuth token using client credentials."""
+        if time.time() < self._reddit_token_expiry:
+            return self._reddit_token
+        resp = requests.post(
+            "https://www.reddit.com/api/v1/access_token",
+            auth=(self.config.REDDIT_CLIENT_ID, self.config.REDDIT_CLIENT_SECRET),
+            data={"grant_type": "client_credentials"},
+            headers={"User-Agent": self.config.REDDIT_USER_AGENT},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        self._reddit_token = data["access_token"]
+        self._reddit_token_expiry = time.time() + data.get("expires_in", 3600) - 60
+        return self._reddit_token
 
     def fetch_all(self) -> Dict[str, List[Dict]]:
         """Fetch from all sources, organized by type."""
@@ -85,9 +104,15 @@ class CryptoDataPipeline:
 
         for sub in subreddits:
             try:
-                # Reddit JSON API (no auth, rate limited)
-                url = f"https://www.reddit.com/r/{sub}/hot.json"
-                headers = {"User-Agent": self.config.REDDIT_USER_AGENT}
+                if self.config.REDDIT_CLIENT_ID and self.config.REDDIT_CLIENT_SECRET:
+                    url = f"https://oauth.reddit.com/r/{sub}/hot.json"
+                    headers = {
+                        "User-Agent": self.config.REDDIT_USER_AGENT,
+                        "Authorization": f"bearer {self._get_reddit_token()}",
+                    }
+                else:
+                    url = f"https://www.reddit.com/r/{sub}/hot.json"
+                    headers = {"User-Agent": self.config.REDDIT_USER_AGENT}
                 resp = requests.get(url, headers=headers, timeout=10)
 
                 if resp.status_code == 429:
