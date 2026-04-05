@@ -51,18 +51,13 @@ class CryptoDataPipeline:
             "exchange": [],
         }
 
-        # Social media (requires Reddit OAuth — public endpoints blocked in CI)
-        if not self.config.REDDIT_CLIENT_ID or not self.config.REDDIT_CLIENT_SECRET:
-            logger.warning(
-                "REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET not set — skipping Reddit"
-            )
-        else:
-            for token in self.config.TOKENS:
-                try:
-                    reddit_data = self._fetch_reddit(token)
-                    result["social"].extend(reddit_data)
-                except Exception as e:
-                    logger.error(f"Reddit error for {token}: {e}")
+        # Social media
+        for token in self.config.TOKENS:
+            try:
+                reddit_data = self._fetch_reddit(token)
+                result["social"].extend(reddit_data)
+            except Exception as e:
+                logger.error(f"Reddit error for {token}: {e}")
 
         # News
         try:
@@ -97,15 +92,19 @@ class CryptoDataPipeline:
         return result
 
     def _reddit_headers(self) -> Dict[str, str]:
-        """Build headers for Reddit OAuth API requests."""
-        return {
-            "User-Agent": self.config.REDDIT_USER_AGENT,
-            "Authorization": f"bearer {self._get_reddit_token()}",
-        }
+        """Build headers for Reddit API requests (OAuth or public)."""
+        if self.config.REDDIT_CLIENT_ID and self.config.REDDIT_CLIENT_SECRET:
+            return {
+                "User-Agent": self.config.REDDIT_USER_AGENT,
+                "Authorization": f"bearer {self._get_reddit_token()}",
+            }
+        return {"User-Agent": self.config.REDDIT_USER_AGENT}
 
     def _reddit_base_url(self) -> str:
-        """Return OAuth base URL for Reddit API."""
-        return "https://oauth.reddit.com"
+        """Return base URL depending on auth availability."""
+        if self.config.REDDIT_CLIENT_ID and self.config.REDDIT_CLIENT_SECRET:
+            return "https://oauth.reddit.com"
+        return "https://www.reddit.com"
 
     def _reddit_get(self, path: str, params: Dict = None) -> Dict:
         """
