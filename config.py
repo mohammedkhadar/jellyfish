@@ -56,7 +56,7 @@ class Config:
     # Reddit (https://www.reddit.com/prefs/apps — create "script" app)
     REDDIT_CLIENT_ID: str = os.getenv("REDDIT_CLIENT_ID", "")
     REDDIT_CLIENT_SECRET: str = os.getenv("REDDIT_CLIENT_SECRET", "")
-    REDDIT_USER_AGENT: str = "crypto-sentiment-bot/1.0"
+    REDDIT_USER_AGENT: str = "Mozilla/5.0 (compatible; mybot/1.0)"
 
     # How many top-engagement posts to fetch comments for per subreddit
     REDDIT_COMMENT_POSTS: int = 5
