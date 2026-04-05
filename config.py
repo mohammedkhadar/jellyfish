@@ -58,6 +58,9 @@ class Config:
     REDDIT_CLIENT_SECRET: str = os.getenv("REDDIT_CLIENT_SECRET", "")
     REDDIT_USER_AGENT: str = "crypto-sentiment-bot/1.0"
 
+    # How many top-engagement posts to fetch comments for per subreddit
+    REDDIT_COMMENT_POSTS: int = 5
+
     # CoinGecko (https://www.coingecko.com/en/api — free tier)
     COINGECKO_API_URL: str = "https://api.coingecko.com/api/v3"
 

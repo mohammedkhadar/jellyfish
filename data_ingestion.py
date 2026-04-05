@@ -91,73 +91,237 @@ class CryptoDataPipeline:
 
         return result
 
+    def _reddit_headers(self) -> Dict[str, str]:
+        """Build headers for Reddit API requests (OAuth or public)."""
+        if self.config.REDDIT_CLIENT_ID and self.config.REDDIT_CLIENT_SECRET:
+            return {
+                "User-Agent": self.config.REDDIT_USER_AGENT,
+                "Authorization": f"bearer {self._get_reddit_token()}",
+            }
+        return {"User-Agent": self.config.REDDIT_USER_AGENT}
+
+    def _reddit_base_url(self) -> str:
+        """Return base URL depending on auth availability."""
+        if self.config.REDDIT_CLIENT_ID and self.config.REDDIT_CLIENT_SECRET:
+            return "https://oauth.reddit.com"
+        return "https://www.reddit.com"
+
+    def _reddit_get(self, path: str, params: Dict = None) -> Dict:
+        """
+        Make a GET request to the Reddit API with rate-limit handling.
+
+        Reddit Thing IDs (per API docs):
+          t1_ = Comment, t2_ = User, t3_ = Post,
+          t4_ = Message, t5_ = Subreddit
+        """
+        url = f"{self._reddit_base_url()}{path}"
+        resp = requests.get(
+            url,
+            headers=self._reddit_headers(),
+            params=params or {},
+            timeout=10,
+        )
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", 5))
+            logger.warning(f"Reddit rate-limited, waiting {retry_after}s")
+            time.sleep(min(retry_after, 10))
+            resp = requests.get(
+                url,
+                headers=self._reddit_headers(),
+                params=params or {},
+                timeout=10,
+            )
+        resp.raise_for_status()
+        return resp.json()
+
     def _fetch_reddit(self, token: str) -> List[Dict]:
         """
-        Fetch recent posts and top comments from crypto subreddits.
+        Fetch recent posts, comments, and search results from crypto subreddits.
 
-        Uses Reddit JSON endpoint (no auth needed for basic access).
-        For production, use PRAW with OAuth.
+        Uses multiple Reddit API listing endpoints (mirroring the documented
+        RedditAPIClient methods):
+          - /hot.json    → getHotPosts   — currently trending
+          - /new.json    → getNewPosts   — latest posts
+          - /rising.json → getRisingPosts — gaining traction
+          - /top.json    → getTopPosts   — highest-scored (24h window)
+          - /comments/{id} → getComments — top comments on high-engagement posts
+          - /search.json   — keyword search within subreddit
         """
         token_config = self.config.TOKEN_CONFIG[token]
         subreddits = token_config.get("subreddits", [])
+        keywords = token_config.get("keywords", [])
         articles = []
+        seen_ids: set = set()  # Deduplicate across listings
+
+        # Listing endpoints to fetch (endpoint_suffix, source_label, params)
+        listings = [
+            ("hot", "reddit_hot", {"limit": 25}),
+            ("new", "reddit_new", {"limit": 25}),
+            ("rising", "reddit_rising", {"limit": 15}),
+            ("top", "reddit_top", {"t": "day", "limit": 15}),
+        ]
 
         for sub in subreddits:
-            try:
-                if self.config.REDDIT_CLIENT_ID and self.config.REDDIT_CLIENT_SECRET:
-                    url = f"https://oauth.reddit.com/r/{sub}/hot.json"
-                    headers = {
-                        "User-Agent": self.config.REDDIT_USER_AGENT,
-                        "Authorization": f"bearer {self._get_reddit_token()}",
-                    }
-                else:
-                    url = f"https://www.reddit.com/r/{sub}/hot.json"
-                    headers = {"User-Agent": self.config.REDDIT_USER_AGENT}
-                resp = requests.get(url, headers=headers, timeout=10)
-
-                if resp.status_code == 429:
-                    logger.warning(f"Reddit rate limited on r/{sub}")
-                    time.sleep(2)
-                    continue
-
-                resp.raise_for_status()
-                data = resp.json()
-
-                for post in data.get("data", {}).get("children", [])[:25]:
-                    post_data = post.get("data", {})
-                    created = datetime.utcfromtimestamp(
-                        post_data.get("created_utc", 0)
+            # --- Listing endpoints ---
+            for endpoint, source_label, extra_params in listings:
+                try:
+                    data = self._reddit_get(
+                        f"/r/{sub}/{endpoint}.json",
+                        params=extra_params,
                     )
+                    posts = data.get("data", {}).get("children", [])
+                    count = 0
+                    for post in posts:
+                        post_data = post.get("data", {})
+                        post_id = post_data.get("name", "")  # e.g. t3_abc123
+                        if post_id in seen_ids:
+                            continue
+                        seen_ids.add(post_id)
 
-                    # Only recent posts (last 24h)
-                    if datetime.utcnow() - created > timedelta(hours=24):
+                        created = datetime.utcfromtimestamp(
+                            post_data.get("created_utc", 0)
+                        )
+                        if datetime.utcnow() - created > timedelta(hours=24):
+                            continue
+
+                        title = post_data.get("title", "")
+                        selftext = post_data.get("selftext", "")[:500]
+                        score = post_data.get("score", 0)
+                        num_comments = post_data.get("num_comments", 0)
+                        upvote_ratio = post_data.get("upvote_ratio", 0.5)
+
+                        articles.append({
+                            "type": "social",
+                            "source": source_label,
+                            "token": token,
+                            "subreddit": sub,
+                            "post_id": post_id,
+                            "title": title,
+                            "text": f"{title}. {selftext}".strip(),
+                            "score": score,
+                            "num_comments": num_comments,
+                            "upvote_ratio": upvote_ratio,
+                            "engagement": score + num_comments * 2,
+                            "published_at": created.isoformat(),
+                            "fetched_at": datetime.utcnow().isoformat(),
+                        })
+                        count += 1
+
+                    logger.info(
+                        f"  Reddit r/{sub}/{endpoint}: {count} posts"
+                    )
+                    time.sleep(1)  # Respect rate limits
+                except Exception as e:
+                    logger.error(f"Reddit r/{sub}/{endpoint}: {e}")
+
+            # --- Keyword search within subreddit ---
+            if keywords:
+                try:
+                    query = " OR ".join(keywords[:5])
+                    data = self._reddit_get(
+                        f"/r/{sub}/search.json",
+                        params={
+                            "q": query,
+                            "restrict_sr": "on",
+                            "sort": "new",
+                            "t": "day",
+                            "limit": 20,
+                        },
+                    )
+                    count = 0
+                    for post in data.get("data", {}).get("children", []):
+                        post_data = post.get("data", {})
+                        post_id = post_data.get("name", "")
+                        if post_id in seen_ids:
+                            continue
+                        seen_ids.add(post_id)
+
+                        created = datetime.utcfromtimestamp(
+                            post_data.get("created_utc", 0)
+                        )
+                        if datetime.utcnow() - created > timedelta(hours=24):
+                            continue
+
+                        title = post_data.get("title", "")
+                        selftext = post_data.get("selftext", "")[:500]
+                        score = post_data.get("score", 0)
+                        num_comments = post_data.get("num_comments", 0)
+
+                        articles.append({
+                            "type": "social",
+                            "source": "reddit_search",
+                            "token": token,
+                            "subreddit": sub,
+                            "post_id": post_id,
+                            "title": title,
+                            "text": f"{title}. {selftext}".strip(),
+                            "score": score,
+                            "num_comments": num_comments,
+                            "engagement": score + num_comments * 2,
+                            "published_at": created.isoformat(),
+                            "fetched_at": datetime.utcnow().isoformat(),
+                        })
+                        count += 1
+
+                    logger.info(
+                        f"  Reddit r/{sub}/search: {count} posts"
+                    )
+                    time.sleep(1)
+                except Exception as e:
+                    logger.error(f"Reddit r/{sub}/search: {e}")
+
+            # --- Fetch top comments from high-engagement posts ---
+            top_posts = sorted(
+                [a for a in articles if a.get("subreddit") == sub],
+                key=lambda x: x.get("engagement", 0),
+                reverse=True,
+            )[:self.config.REDDIT_COMMENT_POSTS]
+
+            for post_article in top_posts:
+                try:
+                    post_id = post_article["post_id"]
+                    # Strip t3_ prefix for the comments endpoint
+                    short_id = post_id.replace("t3_", "")
+                    data = self._reddit_get(
+                        f"/r/{sub}/comments/{short_id}.json",
+                        params={"sort": "top", "limit": 10, "depth": 1},
+                    )
+                    # Comments are in the second listing element
+                    if len(data) < 2:
                         continue
+                    comments = data[1].get("data", {}).get("children", [])
+                    for comment in comments:
+                        if comment.get("kind") != "t1":
+                            continue
+                        c_data = comment.get("data", {})
+                        body = c_data.get("body", "")[:500]
+                        if not body or body == "[deleted]" or body == "[removed]":
+                            continue
 
-                    title = post_data.get("title", "")
-                    selftext = post_data.get("selftext", "")[:500]
-                    score = post_data.get("score", 0)
-                    num_comments = post_data.get("num_comments", 0)
+                        c_score = c_data.get("score", 0)
+                        articles.append({
+                            "type": "social",
+                            "source": "reddit_comment",
+                            "token": token,
+                            "subreddit": sub,
+                            "post_id": post_id,
+                            "comment_id": c_data.get("name", ""),
+                            "parent_id": c_data.get("parent_id", ""),
+                            "text": body,
+                            "score": c_score,
+                            "engagement": c_score,
+                            "published_at": datetime.utcfromtimestamp(
+                                c_data.get("created_utc", 0)
+                            ).isoformat(),
+                            "fetched_at": datetime.utcnow().isoformat(),
+                        })
+                    time.sleep(1)
+                except Exception as e:
+                    logger.error(f"Reddit comments for {post_id}: {e}")
 
-                    articles.append({
-                        "type": "social",
-                        "source": "reddit_post",
-                        "token": token,
-                        "subreddit": sub,
-                        "title": title,
-                        "text": f"{title}. {selftext}".strip(),
-                        "score": score,            # Upvotes
-                        "num_comments": num_comments,
-                        "engagement": score + num_comments * 2,
-                        "published_at": created.isoformat(),
-                        "fetched_at": datetime.utcnow().isoformat(),
-                    })
-
-                logger.info(f"  Reddit r/{sub}: {len(articles)} posts")
-                time.sleep(1)  # Respect rate limits
-
-            except Exception as e:
-                logger.error(f"Reddit r/{sub}: {e}")
-
+        logger.info(
+            f"  Reddit total for {token}: {len(articles)} items"
+        )
         return articles
 
     def _fetch_crypto_news(self) -> List[Dict]:
