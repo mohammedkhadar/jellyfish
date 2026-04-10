@@ -11,6 +11,9 @@ schedule>=1.2.0
 transformers>=4.35.0
 torch>=2.1.0
 
+# RSS feeds
+feedparser>=6.0.0
+
 # Exchange connectivity
 ccxt>=4.0.0
 

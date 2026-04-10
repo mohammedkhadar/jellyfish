@@ -1,0 +1,4 @@
+__pycache__
+.vscode
+crypto_bot.log
+crypto_sentiment.db

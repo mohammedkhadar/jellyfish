@@ -21,7 +21,6 @@ class Config:
             "BTC": {
                 "pair": "BTC/USDT",
                 "coingecko_id": "bitcoin",
-                "subreddits": ["bitcoin", "BitcoinMarkets"],
                 "keywords": [
                     "bitcoin", "BTC", "satoshi", "lightning network",
                     "halving", "hash rate", "mining", "digital gold",
@@ -31,7 +30,6 @@ class Config:
             "ETH": {
                 "pair": "ETH/USDT",
                 "coingecko_id": "ethereum",
-                "subreddits": ["ethereum", "ethfinance"],
                 "keywords": [
                     "ethereum", "ETH", "vitalik", "gas fees",
                     "layer 2", "staking", "EIP", "merge",
@@ -42,7 +40,6 @@ class Config:
             "SOL": {
                 "pair": "SOL/USDT",
                 "coingecko_id": "solana",
-                "subreddits": ["solana"],
                 "keywords": [
                     "solana", "SOL", "phantom", "jupiter",
                     "solana defi", "solana nft", "firedancer",
@@ -53,16 +50,17 @@ class Config:
     )
 
     # ─── Data Sources ──────────────────────────────────────────
-    # Reddit (https://www.reddit.com/prefs/apps — create "script" app)
-    REDDIT_CLIENT_ID: str = os.getenv("REDDIT_CLIENT_ID", "")
-    REDDIT_CLIENT_SECRET: str = os.getenv("REDDIT_CLIENT_SECRET", "")
-    REDDIT_USER_AGENT: str = "Mozilla/5.0 (compatible; mybot/1.0)"
-
-    # How many top-engagement posts to fetch comments for per subreddit
-    REDDIT_COMMENT_POSTS: int = 5
-
-    # CoinGecko (https://www.coingecko.com/en/api — free tier)
+    # CoinGecko (https://www.coingecko.com/en/api — free tier, no key needed)
     COINGECKO_API_URL: str = "https://api.coingecko.com/api/v3"
+
+    # RSS news feeds (free, no key needed)
+    RSS_FEEDS: List[str] = field(
+        default_factory=lambda: [
+            "https://www.coindesk.com/arc/outboundfeeds/rss/",
+            "https://cointelegraph.com/rss",
+            "https://decrypt.co/feed",
+        ]
+    )
 
     # Alternative.me Fear & Greed (free, no key needed)
     FEAR_GREED_URL: str = "https://api.alternative.me/fng/"
@@ -140,14 +138,13 @@ class Config:
     # Source weights
     SOURCE_WEIGHTS: Dict[str, float] = field(
         default_factory=lambda: {
-            "reddit_post": 0.4,
-            "reddit_comment": 0.2,
-            "twitter": 0.5,       # Crypto Twitter is highly influential
+            "coingecko": 0.7,           # Community sentiment + market data
+            "coingecko_trending": 0.5,  # Trending signal
+            "rss_news": 0.6,            # RSS news headlines sentiment
             "news": 0.8,
-            "whale_alert": 1.0,   # On-chain data is high signal
+            "whale_alert": 1.0,         # On-chain data is high signal
             "exchange_data": 0.9,
             "fear_greed": 0.7,
-            "coingecko": 0.6,
         }
     )
 

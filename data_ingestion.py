@@ -2,9 +2,10 @@
 Crypto Data Ingestion Pipeline
 ==============================
 Fetches data from:
-  - Reddit (r/bitcoin, r/ethereum, r/solana, r/CryptoCurrency)
-  - Crypto news (NewsAPI, CoinDesk RSS)
-  - On-chain (Whale Alert, CoinGecko exchange flows)
+  - CoinGecko (trending, community stats, market data — free, no key)
+  - RSS feeds (CoinDesk, CoinTelegraph, Decrypt — free, no key)
+  - Crypto news (NewsAPI)
+  - On-chain (Whale Alert)
   - Exchange metrics (funding rates, open interest via ccxt)
   - Fear & Greed Index (Alternative.me)
 """
@@ -22,25 +23,6 @@ logger = logging.getLogger("ingestion")
 class CryptoDataPipeline:
     def __init__(self, config: Config):
         self.config = config
-        self._reddit_token: str = ""
-        self._reddit_token_expiry: float = 0.0
-
-    def _get_reddit_token(self) -> str:
-        """Fetch OAuth token using client credentials."""
-        if time.time() < self._reddit_token_expiry:
-            return self._reddit_token
-        resp = requests.post(
-            "https://www.reddit.com/api/v1/access_token",
-            auth=(self.config.REDDIT_CLIENT_ID, self.config.REDDIT_CLIENT_SECRET),
-            data={"grant_type": "client_credentials"},
-            headers={"User-Agent": self.config.REDDIT_USER_AGENT},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        self._reddit_token = data["access_token"]
-        self._reddit_token_expiry = time.time() + data.get("expires_in", 3600) - 60
-        return self._reddit_token
 
     def fetch_all(self) -> Dict[str, List[Dict]]:
         """Fetch from all sources, organized by type."""
@@ -51,13 +33,25 @@ class CryptoDataPipeline:
             "exchange": [],
         }
 
-        # Social media
+        # Social / community data from CoinGecko + RSS news feeds
         for token in self.config.TOKENS:
             try:
-                reddit_data = self._fetch_reddit(token)
-                result["social"].extend(reddit_data)
+                cg_data = self._fetch_coingecko_community(token)
+                result["social"].extend(cg_data)
             except Exception as e:
-                logger.error(f"Reddit error for {token}: {e}")
+                logger.error(f"CoinGecko community error for {token}: {e}")
+
+        try:
+            rss_data = self._fetch_rss_news()
+            result["social"].extend(rss_data)
+        except Exception as e:
+            logger.error(f"RSS news error: {e}")
+
+        try:
+            trending = self._fetch_coingecko_trending()
+            result["social"].extend(trending)
+        except Exception as e:
+            logger.error(f"CoinGecko trending error: {e}")
 
         # News
         try:
@@ -91,237 +85,200 @@ class CryptoDataPipeline:
 
         return result
 
-    def _reddit_headers(self) -> Dict[str, str]:
-        """Build headers for Reddit API requests (OAuth or public)."""
-        if self.config.REDDIT_CLIENT_ID and self.config.REDDIT_CLIENT_SECRET:
-            return {
-                "User-Agent": self.config.REDDIT_USER_AGENT,
-                "Authorization": f"bearer {self._get_reddit_token()}",
-            }
-        return {"User-Agent": self.config.REDDIT_USER_AGENT}
-
-    def _reddit_base_url(self) -> str:
-        """Return base URL depending on auth availability."""
-        if self.config.REDDIT_CLIENT_ID and self.config.REDDIT_CLIENT_SECRET:
-            return "https://oauth.reddit.com"
-        return "https://www.reddit.com"
-
-    def _reddit_get(self, path: str, params: Dict = None) -> Dict:
+    def _fetch_coingecko_community(self, token: str) -> List[Dict]:
         """
-        Make a GET request to the Reddit API with rate-limit handling.
+        Fetch community/social stats from CoinGecko for a token.
 
-        Reddit Thing IDs (per API docs):
-          t1_ = Comment, t2_ = User, t3_ = Post,
-          t4_ = Message, t5_ = Subreddit
-        """
-        url = f"{self._reddit_base_url()}{path}"
-        resp = requests.get(
-            url,
-            headers=self._reddit_headers(),
-            params=params or {},
-            timeout=10,
-        )
-        if resp.status_code == 429:
-            retry_after = int(resp.headers.get("Retry-After", 5))
-            logger.warning(f"Reddit rate-limited, waiting {retry_after}s")
-            time.sleep(min(retry_after, 10))
-            resp = requests.get(
-                url,
-                headers=self._reddit_headers(),
-                params=params or {},
-                timeout=10,
-            )
-        resp.raise_for_status()
-        return resp.json()
-
-    def _fetch_reddit(self, token: str) -> List[Dict]:
-        """
-        Fetch recent posts, comments, and search results from crypto subreddits.
-
-        Uses multiple Reddit API listing endpoints (mirroring the documented
-        RedditAPIClient methods):
-          - /hot.json    → getHotPosts   — currently trending
-          - /new.json    → getNewPosts   — latest posts
-          - /rising.json → getRisingPosts — gaining traction
-          - /top.json    → getTopPosts   — highest-scored (24h window)
-          - /comments/{id} → getComments — top comments on high-engagement posts
-          - /search.json   — keyword search within subreddit
+        Free API, no key needed. Returns:
+          - Community score, developer score, public interest score
+          - Social media stats (Twitter followers, Telegram members)
+          - Sentiment votes (up/down percentage)
         """
         token_config = self.config.TOKEN_CONFIG[token]
-        subreddits = token_config.get("subreddits", [])
-        keywords = token_config.get("keywords", [])
+        cg_id = token_config.get("coingecko_id", "")
+        if not cg_id:
+            return []
+
+        url = f"{self.config.COINGECKO_API_URL}/coins/{cg_id}"
+        params = {
+            "localization": "false",
+            "tickers": "false",
+            "market_data": "true",
+            "community_data": "true",
+            "developer_data": "false",
+            "sparkline": "false",
+        }
+        resp = requests.get(url, params=params, timeout=15)
+        if resp.status_code == 429:
+            logger.warning("CoinGecko rate-limited, waiting 30s")
+            time.sleep(30)
+            resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+
         articles = []
-        seen_ids: set = set()  # Deduplicate across listings
+        now = datetime.utcnow().isoformat()
 
-        # Listing endpoints to fetch (endpoint_suffix, source_label, params)
-        listings = [
-            ("hot", "reddit_hot", {"limit": 25}),
-            ("new", "reddit_new", {"limit": 25}),
-            ("rising", "reddit_rising", {"limit": 15}),
-            ("top", "reddit_top", {"t": "day", "limit": 15}),
-        ]
+        # Community data as a social signal
+        community = data.get("community_data", {})
+        sentiment_up = data.get("sentiment_votes_up_percentage", 50)
+        sentiment_down = data.get("sentiment_votes_down_percentage", 50)
+        community_score = data.get("community_score", 0) or 0
 
-        for sub in subreddits:
-            # --- Listing endpoints ---
-            for endpoint, source_label, extra_params in listings:
-                try:
-                    data = self._reddit_get(
-                        f"/r/{sub}/{endpoint}.json",
-                        params=extra_params,
-                    )
-                    posts = data.get("data", {}).get("children", [])
-                    count = 0
-                    for post in posts:
-                        post_data = post.get("data", {})
-                        post_id = post_data.get("name", "")  # e.g. t3_abc123
-                        if post_id in seen_ids:
-                            continue
-                        seen_ids.add(post_id)
+        # Normalize sentiment: 0-100 → -1 to +1
+        sentiment_norm = (sentiment_up - sentiment_down) / 100.0
 
-                        created = datetime.utcfromtimestamp(
-                            post_data.get("created_utc", 0)
-                        )
-                        if datetime.utcnow() - created > timedelta(hours=24):
-                            continue
+        description = data.get("description", {}).get("en", "")[:500]
+        name = data.get("name", token)
 
-                        title = post_data.get("title", "")
-                        selftext = post_data.get("selftext", "")[:500]
-                        score = post_data.get("score", 0)
-                        num_comments = post_data.get("num_comments", 0)
-                        upvote_ratio = post_data.get("upvote_ratio", 0.5)
+        articles.append({
+            "type": "social",
+            "source": "coingecko",
+            "token": token,
+            "title": f"{name} community sentiment",
+            "text": (
+                f"{name} sentiment: {sentiment_up:.0f}% bullish, "
+                f"{sentiment_down:.0f}% bearish. "
+                f"Community score: {community_score}. "
+                f"Twitter followers: {community.get('twitter_followers', 0)}. "
+                f"Telegram members: {community.get('telegram_channel_user_count', 0)}."
+            ),
+            "score": int(sentiment_up - sentiment_down),
+            "engagement": community_score,
+            "sentiment_up_pct": sentiment_up,
+            "sentiment_down_pct": sentiment_down,
+            "sentiment_normalized": sentiment_norm,
+            "published_at": now,
+            "fetched_at": now,
+        })
 
-                        articles.append({
-                            "type": "social",
-                            "source": source_label,
-                            "token": token,
-                            "subreddit": sub,
-                            "post_id": post_id,
-                            "title": title,
-                            "text": f"{title}. {selftext}".strip(),
-                            "score": score,
-                            "num_comments": num_comments,
-                            "upvote_ratio": upvote_ratio,
-                            "engagement": score + num_comments * 2,
-                            "published_at": created.isoformat(),
-                            "fetched_at": datetime.utcnow().isoformat(),
-                        })
-                        count += 1
+        # Market data for price context
+        market = data.get("market_data", {})
+        price_change_24h = market.get("price_change_percentage_24h", 0) or 0
+        price_change_7d = market.get("price_change_percentage_7d", 0) or 0
 
-                    logger.info(
-                        f"  Reddit r/{sub}/{endpoint}: {count} posts"
-                    )
-                    time.sleep(1)  # Respect rate limits
-                except Exception as e:
-                    logger.error(f"Reddit r/{sub}/{endpoint}: {e}")
+        articles.append({
+            "type": "social",
+            "source": "coingecko",
+            "token": token,
+            "title": f"{name} market overview",
+            "text": (
+                f"{name} price change: {price_change_24h:+.1f}% (24h), "
+                f"{price_change_7d:+.1f}% (7d). "
+                f"Market cap rank: #{market.get('market_cap_rank', 'N/A')}."
+            ),
+            "score": int(price_change_24h * 10),
+            "engagement": 0,
+            "published_at": now,
+            "fetched_at": now,
+        })
 
-            # --- Keyword search within subreddit ---
-            if keywords:
-                try:
-                    query = " OR ".join(keywords[:5])
-                    data = self._reddit_get(
-                        f"/r/{sub}/search.json",
-                        params={
-                            "q": query,
-                            "restrict_sr": "on",
-                            "sort": "new",
-                            "t": "day",
-                            "limit": 20,
-                        },
-                    )
-                    count = 0
-                    for post in data.get("data", {}).get("children", []):
-                        post_data = post.get("data", {})
-                        post_id = post_data.get("name", "")
-                        if post_id in seen_ids:
-                            continue
-                        seen_ids.add(post_id)
+        logger.info(f"  CoinGecko {token}: community + market data")
+        time.sleep(2)  # Respect CoinGecko rate limits (10-30 req/min)
+        return articles
 
-                        created = datetime.utcfromtimestamp(
-                            post_data.get("created_utc", 0)
-                        )
-                        if datetime.utcnow() - created > timedelta(hours=24):
-                            continue
+    def _fetch_coingecko_trending(self) -> List[Dict]:
+        """
+        Fetch trending coins from CoinGecko.
 
-                        title = post_data.get("title", "")
-                        selftext = post_data.get("selftext", "")[:500]
-                        score = post_data.get("score", 0)
-                        num_comments = post_data.get("num_comments", 0)
+        High trending score for tracked tokens = social momentum signal.
+        """
+        url = f"{self.config.COINGECKO_API_URL}/search/trending"
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
 
-                        articles.append({
-                            "type": "social",
-                            "source": "reddit_search",
-                            "token": token,
-                            "subreddit": sub,
-                            "post_id": post_id,
-                            "title": title,
-                            "text": f"{title}. {selftext}".strip(),
-                            "score": score,
-                            "num_comments": num_comments,
-                            "engagement": score + num_comments * 2,
-                            "published_at": created.isoformat(),
-                            "fetched_at": datetime.utcnow().isoformat(),
-                        })
-                        count += 1
+        articles = []
+        now = datetime.utcnow().isoformat()
+        tracked_ids = {
+            self.config.TOKEN_CONFIG[t]["coingecko_id"]: t
+            for t in self.config.TOKENS
+        }
 
-                    logger.info(
-                        f"  Reddit r/{sub}/search: {count} posts"
-                    )
-                    time.sleep(1)
-                except Exception as e:
-                    logger.error(f"Reddit r/{sub}/search: {e}")
+        for coin_entry in data.get("coins", []):
+            item = coin_entry.get("item", {})
+            cg_id = item.get("id", "")
+            if cg_id not in tracked_ids:
+                continue
 
-            # --- Fetch top comments from high-engagement posts ---
-            top_posts = sorted(
-                [a for a in articles if a.get("subreddit") == sub],
-                key=lambda x: x.get("engagement", 0),
-                reverse=True,
-            )[:self.config.REDDIT_COMMENT_POSTS]
+            token = tracked_ids[cg_id]
+            rank = item.get("score", 0)
+            name = item.get("name", token)
+            price_change = item.get("data", {}).get(
+                "price_change_percentage_24h", {}
+            ).get("usd", 0) or 0
 
-            for post_article in top_posts:
-                try:
-                    post_id = post_article["post_id"]
-                    # Strip t3_ prefix for the comments endpoint
-                    short_id = post_id.replace("t3_", "")
-                    data = self._reddit_get(
-                        f"/r/{sub}/comments/{short_id}.json",
-                        params={"sort": "top", "limit": 10, "depth": 1},
-                    )
-                    # Comments are in the second listing element
-                    if len(data) < 2:
+            articles.append({
+                "type": "social",
+                "source": "coingecko_trending",
+                "token": token,
+                "title": f"{name} is trending on CoinGecko",
+                "text": (
+                    f"{name} is trending (rank #{rank + 1}). "
+                    f"24h price change: {price_change:+.1f}%."
+                ),
+                "score": max(100 - rank * 10, 10),
+                "engagement": max(100 - rank * 10, 10),
+                "trending_rank": rank,
+                "published_at": now,
+                "fetched_at": now,
+            })
+
+        logger.info(f"  CoinGecko trending: {len(articles)} tracked coins")
+        time.sleep(2)
+        return articles
+
+    def _fetch_rss_news(self) -> List[Dict]:
+        """
+        Fetch crypto news from RSS feeds (CoinDesk, CoinTelegraph, Decrypt).
+
+        Free, no auth, no rate limits. Headlines are fed into FinBERT
+        for sentiment scoring, replacing the discontinued CryptoPanic API.
+        """
+        import feedparser
+
+        articles = []
+        now = datetime.utcnow().isoformat()
+
+        for feed_url in self.config.RSS_FEEDS:
+            try:
+                feed = feedparser.parse(feed_url)
+                source_name = feed.feed.get("title", feed_url)
+
+                for entry in feed.entries[:20]:
+                    title = entry.get("title", "")
+                    summary = entry.get("summary", "")
+                    link = entry.get("link", "")
+                    published = entry.get("published", now)
+
+                    # Match to tracked tokens via keywords
+                    text = f"{title} {summary}".lower()
+                    matched_tokens = []
+                    for token in self.config.TOKENS:
+                        keywords = self.config.TOKEN_CONFIG[token].get("keywords", [])
+                        if any(kw.lower() in text for kw in keywords):
+                            matched_tokens.append(token)
+
+                    if not matched_tokens:
                         continue
-                    comments = data[1].get("data", {}).get("children", [])
-                    for comment in comments:
-                        if comment.get("kind") != "t1":
-                            continue
-                        c_data = comment.get("data", {})
-                        body = c_data.get("body", "")[:500]
-                        if not body or body == "[deleted]" or body == "[removed]":
-                            continue
 
-                        c_score = c_data.get("score", 0)
+                    for token in matched_tokens:
                         articles.append({
                             "type": "social",
-                            "source": "reddit_comment",
+                            "source": "rss_news",
                             "token": token,
-                            "subreddit": sub,
-                            "post_id": post_id,
-                            "comment_id": c_data.get("name", ""),
-                            "parent_id": c_data.get("parent_id", ""),
-                            "text": body,
-                            "score": c_score,
-                            "engagement": c_score,
-                            "published_at": datetime.utcfromtimestamp(
-                                c_data.get("created_utc", 0)
-                            ).isoformat(),
-                            "fetched_at": datetime.utcnow().isoformat(),
+                            "title": title,
+                            "text": f"{title} (via {source_name})",
+                            "url": link,
+                            "score": 0,
+                            "engagement": 0,
+                            "published_at": published,
+                            "fetched_at": now,
                         })
-                    time.sleep(1)
-                except Exception as e:
-                    logger.error(f"Reddit comments for {post_id}: {e}")
+            except Exception as e:
+                logger.warning(f"RSS feed error ({feed_url}): {e}")
 
-        logger.info(
-            f"  Reddit total for {token}: {len(articles)} items"
-        )
+        logger.info(f"  RSS news: {len(articles)} items")
         return articles
 
     def _fetch_crypto_news(self) -> List[Dict]:
